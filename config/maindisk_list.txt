@@ -1,0 +1,10 @@
+# 서버명      마운트포인트
+ccnweb1  /
+ccnweb2  /
+ccnwas1  / /DATA
+ccnwas2  / /DATA
+ccndb    /
+ccndb	 /share
+ccndb    /oracle
+ccndb    /arc
+sms_server /boot

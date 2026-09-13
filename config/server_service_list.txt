@@ -1,0 +1,30 @@
+# 호스트명(패턴) | 감시할 프로세스 목록 (띄어쓰기로 구분)
+testserver|nginx /usr/sbin/snmptrapd crond
+ccnbib|sshd ntp smbd
+ccndb|oracleCCNSD ora_pmon_CCNSD /oracle/app/product/12c/bin/tnslsnr ora_tmon_CCNSD /usr/sbin/snmpd nfsd rpc.mountd
+ccndevdb|ntpd sshd
+ccnengine|/wisenut/sf-1/bin/isc
+ccnjennifer|/DATA/jennifer/server.view /DATA/jennifer/server.data
+CCN_Mail|/apps/sensmail /apps/java/bin /apps/java12/bin
+ccnmessanger|/home/AtMessenger7/tomcat7
+ccnmirror|/usr/sbin/sshd /usr/sbin/smbd
+HyBoostH100|sshd httpd /somansa/common/httpd/bin/httpd /somansa/privacyi /somansa/dlpcenter/tomcat/conf/
+ccnrecdb|/usr/sbin/mysqld /usr/sbin/smbd /usr/sbin/sshd /usr/sbin/crond
+ccnrecstorage01|sshd nfsd
+ccnsbc|./EGIS_VF_PMB [EGIS_VF_HAB] [EGIS_VF_SMB] [EGIS_VF_UCB] [EGIS_VF_MCB] [EGIS_VF_DMB] [EGIS_VF_SPB]
+ccnstaters01|/usr/java/default/bin/java oracleersdb /app/oracle/product/11.2.0/db/bin/tnslsnr /home/ers/app/rtd/conf/db.properties /home/ers/app/dbgw/conf/base.properties /home/ers/app/tcp/conf/base.properties /usr/local/apache-tomcat
+ccnstorage|nfsd /usr/lib/jvm/jre/bin/java vtm_capture_pro vtm_converter /opt/VRTSpbx/bin/pbx_exchange /usr/sbin/mysqld nfsd
+ccnivrtts01|/usr/sbin/NetworkManager /usr/sbin/chronyd /usr/bin/VGAuthService /usr/bin/vmtoolsd /usr/libexec/postfix/master
+ccnvmstorage01|/usr/sbin/vsftpd sshd /usr/sbin/ntpd nfsd
+ccnwas1|httpd /apps/tomcat_portal /apps/tomcat_call /apps/tomcat_batch /apps/tomcat_admin /apps/deveye/deployagent nfsd /home/wisenut/ftserver2022/bin/cmanager
+ccnwas2|httpd /apps/tomcat_portal /apps/tomcat_call /apps/tomcat_pms /apps/tomcat_admin /apps/deveye/deployagent nfsd 
+ccnweb1|httpd nfsd
+ccnweb2|httpd nfsd
+dbsafer|./pnp_oms_dms start /usr/java/default/bin/java ./pnp_watcher start /pnp_statistics start ./pnp_checkintegrity /usr/bin/mysqld_safe
+elearning|/home/bandi_agent/openjdk8u342/bin/java home=/home/mogaha/ftc-inst-app SND_OP: /home/mogaha/ESB_AGENT1.5/adaptor SND_OP2: /home/mogaha/ESB_AGENT1.5/adaptor /home/mogaha/ESB_AGENT1.5/adaptor /ojdbc8.jar:./orai18n.jar FtcKcasLinkBatchScheduler kcas_db.properties kcas_sql.txt /home/mogaha/ftc-dportal-app/data/snd 
+HyBoostNW2000|/somansa/common/httpd/bin/httpd /somansa/ndlp/env/default/config/policy_engine /somansa/ndlp/env/default/bin/Bootstrap /somansa/ndlp/env/default/bin/AgentGuard
+sms_server|KTMoAgent.jar nfsd  ./lib/mcsm.jar  rcsTmpl2sms.jar
+spam.ccn.go.kr|/sniper/apache/bin/httpd /sniper/bin/sslserver /sniper/bin/rblsmtpd
+xcat| mysql smbd ntpd /usr/sbin/httpd
+apiproxy|/usr/sbin/squid
+cisco|

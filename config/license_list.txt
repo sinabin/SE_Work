@@ -1,0 +1,12 @@
+ WEB, WAS, WAF, DDOS, VPN, MAIL, SPAM, HyBoost  	 | 27 | 01 | 02 |      	 SSL Certificate                               
+ DMZ VM           	                             	 | 28 | 06 | 22 |      	 MACHINE Certificate                           
+ Real VM                                       		 | 27 | 11 | 14 |     	 MACHINE Certificate                           
+ IPCC VM             	                          	 | 27 | 11 | 19 |     	 MACHINE Certificate                           
+ Expressway             	                       	 | 26 | 09 | 02 |     	 Expressway Certificate                        
+ Bandi Snc                                               | 27 | 01 | 29 |        IM Certificate 
+ Elearning                      	               	 | 27 | 10 | 08 |     	 Public Information Sharing Center (PISC)      
+ DMZ L4 WAF                             	       	 | 27 | 12 | 31 |     	 License                                       
+ OZ Report                                     		 | 26 | 09 | 10 |     	 License                                       
+ Privacy-i						 | 27 | 03 | 03 |        License
+ 2026 3 Quarter Password                            	 | 26 | 09 | 30 |     	 Changed Password                              
+

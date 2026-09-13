@@ -1,0 +1,23 @@
+# 서버명      마운트포인트
+ccnweb1     /
+ccnweb2     /
+ccnwas1     / /DATA
+ccnwas2     / /DATA
+ccndb       / /share /sharebackup /oracle /arc
+ccnsearch      / /wisenut /DATA
+ccnengine   /
+elearning   /
+ccntts01    /  /boot  /home
+ccnrecdba   / /boot /nfs
+ccnrecdbb   / /run /boot
+ccnmirror01 / /run /boot
+ccnmirror02 / /run /boot
+ccnbib01    / /media /boot
+ccnbib02    / /media /boot
+ccnstaters01 / /app /data /home
+dbsafer     / /boot /home
+spam	    / /boot /sniper
+ccnmail     / /boot /data
+ccnmessanger / /boot
+apiproxy   / /boot
+ 

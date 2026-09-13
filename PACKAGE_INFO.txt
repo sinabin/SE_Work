@@ -1,0 +1,4 @@
+Package: SE_업무 Codex Local Project
+Generated: 2026-09-12
+Purpose: Local Codex context migration / operations knowledge base
+Security: Uploaded plaintext credentials removed from packaged scripts
