@@ -15,7 +15,7 @@ SERVICE_FILE="$TXT_DIR/server_service_list.txt"
 
 # 로그 및 임시 파일 경로
 HISTORY_CSV="$LOG_DIR/monitoring_history_$(date +%Y%m).csv"
-RAW_DATA_FILE="$LOG_DIR/dashboard_temp_$(date +%s).raw"
+RUN_LOG="$LOG_DIR/monitor_dashboard_run.log"
 
 # MySQL 접속 정보
 DB_HOST="localhost"
@@ -39,8 +39,35 @@ NFS_TIMEOUT_SEC=3
 mkdir -p "$TXT_DIR" "$LOG_DIR"
 if [ ! -f "$LICENSE_FILE" ]; then touch "$LICENSE_FILE"; fi
 
+# --- [개선] 동시 실행 방지 (cron 실행이 겹치는 것을 막음) ---
+LOCK_FILE="/tmp/monitor_dashboard.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 이미 실행 중인 인스턴스가 있어 종료합니다." >> "$RUN_LOG"
+    exit 1
+fi
+
+# --- [개선] 임시 데이터 파일: mktemp으로 생성 (동시 실행 시 파일명 충돌 방지) ---
+RAW_DATA_FILE=$(mktemp "$LOG_DIR/dashboard_temp_XXXXXX.raw")
+
+# --- [개선] 스크립트 자체 실행 로그: 표준에러만 로그 파일에 누적 (화면 출력은 그대로 유지) ---
+exec 2>>"$RUN_LOG"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] monitor_dashboard.sh 실행 시작" >> "$RUN_LOG"
+
 # 스크립트 종료 시 임시 파일 자동 삭제 (Trap)
-trap "rm -f $RAW_DATA_FILE" EXIT
+trap 'rm -f "$RAW_DATA_FILE"; flock -u 200' EXIT
+
+# --- [개선] SQL 값 이스케이프 함수 (작은따옴표 이스케이프로 쿼리 깨짐/인젝션 방지) ---
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# --- [개선] MySQL 사전 접속 확인 (DB가 죽어있으면 매 호스트마다 에러가 쏟아지는 것을 방지) ---
+DB_AVAILABLE=true
+if ! MYSQL_PWD="$DB_PASS" mysqladmin -h"$DB_HOST" -u"$DB_USER" ping --connect-timeout=3 >/dev/null 2>>"$RUN_LOG"; then
+    DB_AVAILABLE=false
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] MySQL 접속 실패 — 이번 실행은 화면 출력만 진행하고 DB 저장은 생략합니다." >> "$RUN_LOG"
+fi
 
 
 # ==============================================================================
@@ -160,13 +187,22 @@ REMOTE_CMD_TEMPLATE='
                         else { if(b==\"\")b=0; if(c==\"\")c=0; used=t-(f+b+c) }
                         if(t>0) printf \"%.0f\", (used/t)*100; else print 0
                      }" /proc/meminfo)
-#ntp
+
+    # --- [개선] NTP: chronyc sources의 피어 검출뿐 아니라 tracking의 Leap status까지 확인
+    #     (Leap status가 Normal이 아니면 피어가 잡혀도 실제로는 비정상 동기화 상태일 수 있음) ---
     NTP_PEER=""
     if command -v chronyc >/dev/null 2>&1; then
         PEER=$(chronyc -n sources | awk "\$1 ~ /\*/ {print \$2}")
-        [ -n "$PEER" ] && NTP_PEER="$PEER"
+        if [ -n "$PEER" ]; then
+            LEAP=$(chronyc tracking 2>/dev/null | awk -F: "/Leap status/ {gsub(/^[ \t]+/,\"\",\$2); print \$2}")
+            if [ -z "$LEAP" ] || [ "$LEAP" == "Normal" ]; then
+                NTP_PEER="$PEER"
+            else
+                NTP_PEER="NoSync"
+            fi
+        fi
     fi
-  
+
     if [ -z "$NTP_PEER" ] && command -v ntpq >/dev/null 2>&1; then
         PEER=$(ntpq -pn | awk "/^\*/ {print \$1}" | sed "s/^\*//")
         [ -n "$PEER" ] && NTP_PEER="$PEER"
@@ -196,7 +232,22 @@ REMOTE_CMD_TEMPLATE='
     case "$HOSTNAME" in __USER_MAPPING_BLOCK__ esac
     FINAL_ACC_MSG=""
     for u in $TARGET_USERS; do
-        CHAGE_INFO=$(sudo -n LC_ALL=C chage -l "$u" 2>/dev/null)
+        # --- [개선] chage 명령 자체가 없는 경우와 sudo 거부, 대상 계정 없음을 구분해서 표시
+        #     (기존에는 전부 뭉뚱그려 ChkErr로만 표시되어 원인 파악이 어려웠음) ---
+        if ! command -v chage >/dev/null 2>&1; then
+            FINAL_ACC_MSG="${FINAL_ACC_MSG} $u:NoChageCmd"
+            continue
+        fi
+        CHAGE_RAW=$(sudo -n LC_ALL=C chage -l "$u" 2>&1)
+        if echo "$CHAGE_RAW" | grep -qi "no such user\|does not exist"; then
+            FINAL_ACC_MSG="${FINAL_ACC_MSG} $u:NoUser"
+            continue
+        fi
+        if echo "$CHAGE_RAW" | grep -qi "^sudo:"; then
+            FINAL_ACC_MSG="${FINAL_ACC_MSG} $u:SudoDenied"
+            continue
+        fi
+        CHAGE_INFO="$CHAGE_RAW"
         if [ -z "$CHAGE_INFO" ]; then FINAL_ACC_MSG="${FINAL_ACC_MSG} $u:ChkErr"; continue; fi
         EXP_STR=$(echo "$CHAGE_INFO" | grep "Password expires" | cut -d: -f2 | sed "s/^ //g")
         LAST_CHG=$(echo "$CHAGE_INFO" | grep "Last password change" | cut -d: -f2 | sed "s/^ //g")
@@ -215,30 +266,14 @@ REMOTE_CMD_TEMPLATE='
     done
     if [ -z "$FINAL_ACC_MSG" ]; then ACC_RES="Ok"; else ACC_RES=$(echo $FINAL_ACC_MSG | sed "s/^ //g"); fi
 
-    # 업타임 수집 변수 추가
-    UPT_RAW=$(uptime)
-
-    UPT_VAL=$(echo $UPT_RAW | cut -d'p' -f2- | cut -d',' -f1,2)
-
+    # --- [개선] Uptime: uptime -p(표준 pretty 포맷)를 우선 사용하고, 실패 시에만 기존 파싱 방식으로 폴백
+    #     (기존의 cut -d'p' 방식은 로케일/호스트명에 'p'가 포함된 경우 등 예외 케이스에 취약) ---
+    UPT_VAL=$(uptime -p 2>/dev/null | sed "s/^up //")
     if [ -z "$UPT_VAL" ]; then
-        UPT_VAL="Unknown"
+        UPT_RAW=$(uptime)
+        UPT_VAL=$(echo $UPT_RAW | cut -d'p' -f2- | cut -d',' -f1,2)
     fi
-
-    
-    ############################### 251226 수정#####################################
-    #UPT_VAL=$(uptime -p | sed "s/up //")
-    #[ -z "$UPT_VAL" ] && UPT_VAL="Unknown"
-
-    # 1. DISK_RES 줄바꿈 제거 (여러 개일 경우 콤마로 구분)
-    #[ -z "$DISK_CHECK" ] && DISK_RES="OK" || DISK_RES=$(echo $DISK_CHECK | tr '\n' ',' | sed 's/,$//')
-
-    # 2. 서비스/계정 메시지 공백 및 줄바꿈 정리
-    #SVC_MSG=$(echo $SVC_MSG | tr -d '\n')
-    #ACC_RES=$(echo $ACC_RES | tr -d '\n')
-
-    # 3. 최종 출력 (순서 고정)
-    # 호스트네임은 마스터 스크립트에서 붙여준다고 가정하면 아래와 같이 출력
-    # echo "$CPU_USAGE|$MEM_USAGE|$DISK_RES|$NFS_RES|$NTP_FINAL|$SVC_MSG|$ACC_RES|$SEC_MSG|$UPT_VAL"
+    [ -z "$UPT_VAL" ] && UPT_VAL="Unknown"
 
     # DISK_CHECK가 여러 줄일 경우 한 줄로 병합 (예: /data1(85%) /data2(90%))
     DISK_RES=$(echo $DISK_CHECK | xargs) 
@@ -267,8 +302,15 @@ REMOTE_CMD="${REMOTE_CMD/__PASS_WARN_DAYS__/$PASS_WARN_DAYS}"
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 
 {
+    # --- [개선] pdsh 실행 결과가 비어있을 때(설정 오류 등) 원인 파악용 로그 남김 ---
     if command -v pdsh >/dev/null 2>&1; then
-        pdsh -g all "$REMOTE_CMD" 2>/dev/null | sed 's/: /|/'
+        PDSH_OUT=$(pdsh -g all "$REMOTE_CMD" 2>>"$RUN_LOG")
+        if [ -z "$PDSH_OUT" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] pdsh 결과가 비어 있습니다 (pdsh 설정/그룹(all) 확인 필요)" >> "$RUN_LOG"
+        fi
+        echo "$PDSH_OUT" | sed 's/: /|/'
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] pdsh 명령을 찾을 수 없습니다" >> "$RUN_LOG"
     fi
 
     CCN_DIR="/home/ccnuser/data/ccnsearch"
@@ -311,39 +353,84 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
         echo "ccnsearch|$CPU_USAGE|$MEM_USAGE|$DISK_RES|$NFS_RES|$NTP_FINAL|$SVC_MSG|$ACC_RES|-|Unknown"
     fi
 
+    # ==========================================================================
+    # Cisco(SNMP) 대상 — vg1/vg2/ipcc_sw01/ipcc_sw02
+    # SNMP 방어로직: 1) 도달성 선체크  2) 필드별 실패값 방어  3) 화면 색상 반영(6번 섹션 awk)
+    # ==========================================================================
     CISCO_TARGETS="1.vg1 2.vg2 3.ipcc_sw01 4.ipcc_sw02"
     SNMP_COMM="${SNMP_COMMUNITY:-CHANGE_ME}"
     SNMP_OPTS="-t 1 -r 1 -v2c -c $SNMP_COMM -Oqv"
     for cisco in $CISCO_TARGETS; do
         cisco=$(echo "$cisco" | tr -d '[:space:]')
         if ! command -v snmpget >/dev/null 2>&1; then echo "$cisco|0|0|-|-|ToolMissing|Check|-|-|-"; continue; fi
+
         case "$cisco" in
             "1.vg1"|"2.vg2") TARGET_NTP="192.168.3.110" ;;
             "3.ipcc_sw01"|"4.ipcc_sw02") TARGET_NTP="192.168.3.66" ;;
             *) TARGET_NTP="Unknown" ;;
         esac
+
+        # --- SNMP 도달성 선체크: 표준 sysUpTime OID로 한 번 찔러본다 (아래 uptime 계산에도 재사용) ---
+        PROBE=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.2.1.1.3.0 2>/dev/null)
+        if [ -z "$PROBE" ] || [[ "$PROBE" == *"Timeout"* ]] || [[ "$PROBE" == *"No Response"* ]] || [[ "$PROBE" == *"No Such"* ]]; then
+            echo "$cisco|0|0|-|None|SnmpFail ($(date "+%H:%M:%S"))|SnmpFail:NoResponse|-|-|-"
+            continue
+        fi
+        UPTIME_RAW="$PROBE"
+
+        # CPU
         CISCO_CPU=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.4.1.9.9.109.1.1.1.1.5.1 2>/dev/null)
         if ! [[ "$CISCO_CPU" =~ ^[0-9]+$ ]]; then CISCO_CPU=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.4.1.9.2.1.58.0 2>/dev/null); fi
-        CISCO_CPU=$(echo "$CISCO_CPU" | awk '{if($1~/^[0-9]+$/){if($1>100)print 100; else print $1} else print 0}')
+        if [[ "$CISCO_CPU" =~ ^[0-9]+$ ]]; then
+            [ "$CISCO_CPU" -gt 100 ] && CISCO_CPU=100
+        else
+            CISCO_CPU=-1
+        fi
+
+        # 메모리
         MEM_USED=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.4.1.9.9.48.1.1.1.5.1 2>/dev/null)
         MEM_FREE=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.4.1.9.9.48.1.1.1.6.1 2>/dev/null)
-        [[ ! "$MEM_USED" =~ ^[0-9]+$ ]] && MEM_USED=0
-        [[ ! "$MEM_FREE" =~ ^[0-9]+$ ]] && MEM_FREE=0
-        CISCO_MEM=$(awk -v u="$MEM_USED" -v f="$MEM_FREE" 'BEGIN { t=u+f; if(t>0) printf "%.0f", (u/t)*100; else print "0" }')
+        if [[ "$MEM_USED" =~ ^[0-9]+$ ]] && [[ "$MEM_FREE" =~ ^[0-9]+$ ]] && [ $((MEM_USED + MEM_FREE)) -gt 0 ]; then
+            CISCO_MEM=$(awk -v u="$MEM_USED" -v f="$MEM_FREE" 'BEGIN { printf "%.0f", (u/(u+f))*100 }')
+        else
+            CISCO_MEM=-1
+        fi
+
+        # 장비 시각 (실패 시 xcat 로컬 시각으로 대체하되 * 표시로 출처 구분)
         RAW_TIME=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.2.1.25.1.2.0 2>/dev/null)
-        if [[ "$RAW_TIME" == *"No Such"* ]] || [[ -z "$RAW_TIME" ]]; then TIME_ONLY=$(date "+%H:%M:%S"); else TIME_ONLY=$(echo "$RAW_TIME" | awk -F, '{print $2}' | cut -d. -f1); fi
+        if [[ "$RAW_TIME" == *"No Such"* ]] || [[ -z "$RAW_TIME" ]]; then
+            TIME_ONLY="$(date "+%H:%M:%S")*"
+        else
+            TIME_ONLY=$(echo "$RAW_TIME" | awk -F, '{print $2}' | cut -d. -f1)
+        fi
+
+        # NTP 동기화 상태 (SYNC_STATE 비어있음=NoData, 3/alarm=NoSync로 명확히 구분)
         SYNC_STATE=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.4.1.9.9.168.1.1.1.0 2>/dev/null)
-        if [[ "$SYNC_STATE" == "3" ]] || [[ "$SYNC_STATE" == *"alarm"* ]]; then CISCO_NTP="NoSync ($TIME_ONLY)"; else CISCO_NTP="$TARGET_NTP ($TIME_ONLY)"; fi
-        UPTIME_RAW=$(snmpget $SNMP_OPTS "$cisco" .1.3.6.1.2.1.1.3.0 2>/dev/null)
+        if [ -z "$SYNC_STATE" ] || [[ "$SYNC_STATE" == *"No Such"* ]]; then
+            CISCO_NTP="NoData ($TIME_ONLY)"
+        elif [[ "$SYNC_STATE" == "3" ]] || [[ "$SYNC_STATE" == *"alarm"* ]]; then
+            CISCO_NTP="NoSync ($TIME_ONLY)"
+        else
+            CISCO_NTP="$TARGET_NTP ($TIME_ONLY)"
+        fi
+
+        # Uptime
         UPTIME_CLEAN=$(echo "$UPTIME_RAW" | sed 's/Timeticks:.*) //' | sed 's/^ //')
         PRETTY_TIME=$(echo "$UPTIME_CLEAN" | sed 's/ days, /:/g' | sed 's/ day, /:/g')
         if [[ "$UPTIME_CLEAN" == *"days"* ]]; then DAY_ONLY=$(echo "$UPTIME_CLEAN" | awk -F' days' '{print $1}' | awk '{print $NF}'); else DAY_ONLY=0; fi
-        [[ " 1.vg1 2.vg2 3.ipcc_sw01 4.ipcc_sw02 " =~ " $cisco " ]] && NEED_FIX=true || NEED_FIX=false
-        if [[ "$DAY_ONLY" =~ ^[0-9]+$ ]]; then
+        NEED_FIX=true   # vg1/vg2/ipcc_sw01/ipcc_sw02 전부 100일 미만 시 497+ 보정 대상
+        if [ -z "$UPTIME_CLEAN" ] || [[ "$UPTIME_RAW" == *"No Such"* ]]; then
+            UPTIME_FMT="UPTIME:NoData"
+        elif [[ "$DAY_ONLY" =~ ^[0-9]+$ ]]; then
             if [ "$NEED_FIX" = true ] && [ "$DAY_ONLY" -lt 100 ]; then UPTIME_FMT="UPTIME:497+${PRETTY_TIME}"; else UPTIME_FMT="UPTIME:${PRETTY_TIME}"; fi
-        else UPTIME_FMT="Down"; fi
+        else
+            UPTIME_FMT="Down"
+        fi
+
+        # 포트 up 개수
         PORT_UP_CNT=$(snmpwalk $SNMP_OPTS "$cisco" .1.3.6.1.2.1.2.2.1.8 2>/dev/null | grep -cE "^1$|^up$")
-        echo "$cisco|$CISCO_CPU|$CISCO_MEM|-|None|$CISCO_NTP|$UPTIME_FMT, Port:$PORT_UP_CNT|-|-|-|$UPTIME_CLEAN"
+
+        echo "$cisco|$CISCO_CPU|$CISCO_MEM|-|None|$CISCO_NTP|$UPTIME_FMT, Port:$PORT_UP_CNT|-|-|-"
     done
 } | sort > "$RAW_DATA_FILE"
 
@@ -351,57 +438,40 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 # ==============================================================================
 # 5. 데이터 저장 (CSV & MySQL - 서버 상태)
 # ==============================================================================
-#CUR_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-#
-## 5-1. CSV 저장 및 MySQL 저장
-#if [ ! -f "$HISTORY_CSV" ]; then echo "Time,Hostname,CPU,MEM,DISK,NFS,NTP,Service,Account,Security" > "$HISTORY_CSV"; fi
-#
-#while IFS="|" read -r HOST CPU MEM DISK NFS NTP SVC ACC SEC UPT; do
-#    echo "$CUR_TIME,$HOST,$CPU,$MEM,$DISK,$NFS,$NTP,$SVC,$ACC,$SEC,$UPT" >> "$HISTORY_CSV"
-#
-#    # 5-2. MySQL 저장 (linux_server_status 테이블)
-#    # 수치에서 % 등 특수문자 제거 후 깔끔하게 입력
-#    CPU_VAL=$(echo "$CPU" | tr -d '%')
-#    MEM_VAL=$(echo "$MEM" | tr -d '%')
-#    
-#    QUERY="INSERT INTO linux_server_status (check_time, hostname, cpu_usage, mem_usage, disk_warning, nfs_status, ntp_info, service_info, acc_status, sec_event, uptime)
-#           VALUES ('$CUR_TIME', '$HOST', '$CPU_VAL', '$MEM_VAL', '$DISK', '$NFS', '$NTP', '$SVC', '$ACC', '$SEC', '$UPT');"
-#
-#    MYSQL_PWD="$DB_PASS" mysql -h"$DB_HOST" -u"$DB_USER" "$DB_NAME" -e "$QUERY" 2>/dev/null
-#done < "$RAW_DATA_FILE"
+CUR_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 
-
-    CUR_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-
-    if [ ! -f "$HISTORY_CSV" ]; then 
+if [ ! -f "$HISTORY_CSV" ]; then
     echo "Time,Hostname,CPU,MEM,DISK,NFS,NTP,Service,Account,Security,Uptime" > "$HISTORY_CSV"
-    fi
+fi
 
-    # RAW_DATA_FILE을 읽을 때 혹시 모를 빈 줄이나 잘못된 줄바꿈 방지
-    while IFS="|" read -r HOST CPU MEM DISK NFS NTP SVC ACC SEC UPT; do
+while IFS="|" read -r HOST CPU MEM DISK NFS NTP SVC ACC SEC UPT; do
     [ -z "$HOST" ] && continue
 
     echo "$CUR_TIME,$HOST,$CPU,$MEM,\"$DISK\",$NFS,\"$NTP\",\"$SVC\",\"$ACC\",$SEC,\"$UPT\"" >> "$HISTORY_CSV"
 
+    # --- [개선] DB가 접속 불가 상태면 INSERT 자체를 건너뛰어 에러 스팸 방지 ---
+    [ "$DB_AVAILABLE" = false ] && continue
+
     CPU_VAL=$(echo "$CPU" | tr -d '%')
     MEM_VAL=$(echo "$MEM" | tr -d '%')
-    
-    DISK_ESC=$(echo "$DISK" | tr -d '\r\n')
-    SVC_ESC=$(echo "$SVC" | tr -d '\r\n')
-    NTP_ESC=$(echo "$NTP" | tr -d '\r\n')
-    UPT_ESC=$(echo "$UPT" | tr -d '\r\n')
+
+    DISK_ESC=$(sql_escape "$(echo "$DISK" | tr -d '\r\n')")
+    SVC_ESC=$(sql_escape "$(echo "$SVC" | tr -d '\r\n')")
+    NTP_ESC=$(sql_escape "$(echo "$NTP" | tr -d '\r\n')")
+    UPT_ESC=$(sql_escape "$(echo "$UPT" | tr -d '\r\n')")
+    HOST_ESC=$(sql_escape "$HOST")
+    ACC_ESC=$(sql_escape "$ACC")
+    SEC_ESC=$(sql_escape "$SEC")
 
     QUERY="INSERT INTO linux_server_status 
            (check_time, hostname, cpu_usage, mem_usage, disk_warning, nfs_status, ntp_info, service_info, acc_status, sec_event, uptime)
            VALUES 
-           ('$CUR_TIME', '$HOST', '$CPU_VAL', '$MEM_VAL', '$DISK_ESC', '$NFS', '$NTP_ESC', '$SVC_ESC', '$ACC', '$SEC', '$UPT_ESC');"
-    
-    #DB insert 확인
-    #echo "실행될 쿼리: $QUERY"    
+           ('$CUR_TIME', '$HOST_ESC', '$CPU_VAL', '$MEM_VAL', '$DISK_ESC', '$NFS', '$NTP_ESC', '$SVC_ESC', '$ACC_ESC', '$SEC_ESC', '$UPT_ESC');"
 
-    MYSQL_PWD="$DB_PASS" mysql -h"$DB_HOST" -u"$DB_USER" "$DB_NAME" -e "$QUERY"
-    
-    done < "$RAW_DATA_FILE"
+    # --- [개선] 에러는 화면이 아닌 실행 로그로만 기록 ---
+    MYSQL_PWD="$DB_PASS" mysql -h"$DB_HOST" -u"$DB_USER" "$DB_NAME" -e "$QUERY" 2>>"$RUN_LOG"
+
+done < "$RAW_DATA_FILE"
 
 
 # ==============================================================================
@@ -420,19 +490,22 @@ function print_cell(t,c,w) { l=length(t); p=w-l; if(p<0)p=0; printf "%s%s%s%*s",
 {
     count++;
     h=$1; cpu=$2+0; mem=$3+0; disk=$4; nfs=$5; ntp=$6; svc=$7; acc=$8; sec=$9; upt=$10;
-    
+
+    # --- [개선] HOSTNAME도 다른 컬럼처럼 길면 잘라서 표가 깨지지 않도록 처리 ---
+    if(length(h)>18) h=substr(h,1,16)".."
     printf "| %-2d | %-18s | ", count, h
-    
-    if (cpu >= cpu_lim) print_cell(cpu"%", RED, 6); else print_cell(cpu"%", GREEN, 6); printf " | "
-    if (mem >= mem_lim) print_cell(mem"%", RED, 6); else print_cell(mem"%", GREEN, 6); printf " | "
+
+    if (cpu < 0) print_cell("N/A", RED, 6); else if (cpu >= cpu_lim) print_cell(cpu"%", RED, 6); else print_cell(cpu"%", GREEN, 6); printf " | "
+    if (mem < 0) print_cell("N/A", RED, 6); else if (mem >= mem_lim) print_cell(mem"%", RED, 6); else print_cell(mem"%", GREEN, 6); printf " | "
     if(index(sec,"Brute")>0 || index(sec,"Fail")>0) print_cell(sec,RED,12); else if(sec=="Clean") print_cell("Clean",GREEN,12); else print_cell("-",GREEN,12); printf " | "
-    if(length(ntp)>28) ntp=substr(ntp,1,26)".."; if(index(ntp,"Down")>0 || index(ntp,"NoSync")>0) print_cell(ntp,RED,28); else print_cell(ntp,GREEN,28); printf " | "
-    if(index(svc,"Zombie")>0 || index(svc,"Fail")>0 || index(svc,"Down")>0 || index(svc,"err")>0 || index(svc,"Missing")>0) {
+    if(length(ntp)>28) ntp=substr(ntp,1,26)"..";
+    if(index(ntp,"Down")>0 || index(ntp,"NoSync")>0 || index(ntp,"NoData")>0 || index(ntp,"SnmpFail")>0) print_cell(ntp,RED,28); else print_cell(ntp,GREEN,28); printf " | "
+    if(index(svc,"Zombie")>0 || index(svc,"Fail")>0 || index(svc,"Down")>0 || index(svc,"err")>0 || index(svc,"Missing")>0 || index(svc,"NoData")>0) {
         if(length(svc)>40) svc=substr(svc,1,40); print_cell(svc,RED,40);
     } else if(index(svc,"UPTIME")>0) {
         if(index(svc,"497+")>0) print_cell(svc,YELLOW,40); else print_cell(svc,GREEN,40);
     } else { print_cell("Running",GREEN,40); } printf " | "
-    if(index(acc,"EXP")>0 || index(acc,"Must")>0) print_cell(acc,RED,16); else if(acc=="Ok") print_cell(acc,GREEN,16); else if(acc=="-"||acc=="") print_cell("-",GREEN,16); else print_cell(acc,YELLOW,16); printf " | "
+    if(index(acc,"EXP")>0 || index(acc,"Must")>0 || index(acc,"SudoDenied")>0 || index(acc,"NoUser")>0 || index(acc,"NoChageCmd")>0) print_cell(acc,RED,16); else if(acc=="Ok") print_cell(acc,GREEN,16); else if(acc=="-"||acc=="") print_cell("-",GREEN,16); else print_cell(acc,YELLOW,16); printf " | "
     if(disk=="OK") print_cell("OK",GREEN,18); else if(disk=="-"||disk=="") print_cell("-",GREEN,18); else { if(length(disk)>18) disk=substr(disk,1,18); print_cell(disk,RED,18) } printf " | "
     if(nfs=="OK") print_cell("OK",GREEN,8); else if(index(nfs,"InActive")>0) print_cell("InActive",YELLOW,8); else if(nfs=="None"||nfs=="-"||nfs=="") print_cell("-",YELLOW,8); else print_cell(nfs,RED,8);
     printf " |\n"
@@ -459,7 +532,7 @@ while IFS="|" read -r L_HOST L_YY L_MM L_DD L_NAME || [ -n "$L_HOST" ]; do
     L_DD=$(echo "$L_DD" | xargs)
     L_NAME=$(echo "$L_NAME" | xargs)
 
-    # 2. 날짜 문자열 생성 (에러 방지: %s 사용하여 문자열로 결합)
+    # 2. 날짜 문자열 생성 (연도는 2자리만 관리되므로 "20"을 고정 접두어로 사용 — 2000~2099년만 지원)
     F_YY=$(printf "%02s" "$L_YY" | tr ' ' '0')
     F_MM=$(printf "%02s" "$L_MM" | tr ' ' '0')
     F_DD=$(printf "%02s" "$L_DD" | tr ' ' '0')
@@ -484,14 +557,23 @@ while IFS="|" read -r L_HOST L_YY L_MM L_DD L_NAME || [ -n "$L_HOST" ]; do
     # 4. 화면 출력
     printf "| %-48s | %-48s | %-20s | %-56s |\n" "$L_HOST" "$L_NAME" "$FULL_DATE" "$STATUS_MSG"
 
-    # 5. MySQL 저장
-    L_QUERY="INSERT INTO license_status (target_group, expiry_date, license_name, status_summary, updated_at)
-             VALUES ('$L_HOST', '$FULL_DATE', '$L_NAME', '$STATUS_MSG', '$CUR_TIME')
-             ON DUPLICATE KEY UPDATE expiry_date='$FULL_DATE', status_summary='$STATUS_MSG', updated_at='$CUR_TIME';"
-    
-    MYSQL_PWD="$DB_PASS" mysql -h"$DB_HOST" -u"$DB_USER" "$DB_NAME" -e "$L_QUERY" 2>/dev/null
+    # 5. MySQL 저장 (DB 접속 불가 시 건너뜀, 값은 이스케이프 처리)
+    if [ "$DB_AVAILABLE" = true ]; then
+        L_HOST_ESC=$(sql_escape "$L_HOST")
+        L_NAME_ESC=$(sql_escape "$L_NAME")
+        STATUS_MSG_ESC=$(sql_escape "$STATUS_MSG")
+
+        L_QUERY="INSERT INTO license_status (target_group, expiry_date, license_name, status_summary, updated_at)
+                 VALUES ('$L_HOST_ESC', '$FULL_DATE', '$L_NAME_ESC', '$STATUS_MSG_ESC', '$CUR_TIME')
+                 ON DUPLICATE KEY UPDATE expiry_date='$FULL_DATE', status_summary='$STATUS_MSG_ESC', updated_at='$CUR_TIME';"
+
+        # --- [개선] 에러는 화면이 아닌 실행 로그로만 기록 ---
+        MYSQL_PWD="$DB_PASS" mysql -h"$DB_HOST" -u"$DB_USER" "$DB_NAME" -e "$L_QUERY" 2>>"$RUN_LOG"
+    fi
 
 done < "$LICENSE_FILE"
 
 echo "========================================================================================================================================================================================="
 echo ""
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] monitor_dashboard.sh 실행 종료" >> "$RUN_LOG"
